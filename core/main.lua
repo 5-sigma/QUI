@@ -4551,7 +4551,16 @@ function QUICore:SetupEncounterWarningsSecretValuePatch()
         return true
     end
 
-    if TryPatch() then
+    local patched = TryPatch()
+
+    for _, callback in ipairs(self._postEnableCallbacks or {}) do
+        local ok, err = pcall(callback, self)
+        if not ok and geterrorhandler then
+            geterrorhandler()(err)
+        end
+    end
+
+    if patched then
         return
     end
 
@@ -4575,13 +4584,6 @@ function QUICore:SetupEncounterWarningsSecretValuePatch()
     end)
 
     self.__encounterWarningsPatchFrame = patchFrame
-
-    for _, callback in ipairs(self._postEnableCallbacks or {}) do
-        local ok, err = pcall(callback, self)
-        if not ok and geterrorhandler then
-            geterrorhandler()(err)
-        end
-    end
 end
 
 -- DEPRECATED: ProcessPendingBackdrops is dead code. The old backdrop pending system
