@@ -4027,7 +4027,7 @@ local function IsAnyEditModeActive()
     return blizzardActive or unitFrameEditActive
 end
 
--- Enable/disable keyboard handling based on selection
+-- Enable/disable keyboard handling based on edit mode state
 function QUICore:UpdateEditModeKeyHandler()
     if InCombatLockdown() then
         EditModeKeyHandler:EnableKeyboard(false)
@@ -4040,8 +4040,10 @@ function QUICore:UpdateEditModeKeyHandler()
         return
     end
 
-
-    if self.EditModeSelection and self.EditModeSelection.selectedType then
+    -- Enable keyboard whenever edit mode is active (not just on selection).
+    -- Individual frames no longer call EnableKeyboard — this is the sole handler.
+    -- Arrow keys only nudge when something is selected (OnKeyDown propagates otherwise).
+    if IsAnyEditModeActive() then
         EditModeKeyHandler:EnableKeyboard(true)
     else
         EditModeKeyHandler:EnableKeyboard(false)
