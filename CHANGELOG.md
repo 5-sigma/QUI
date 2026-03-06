@@ -66,6 +66,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 
 
+
+## v2.46.5 - 2026-03-06
+
+### Added
+- added tracked buff bar factory to QUI CDM engine
+
+### Fixed
+- fix: buff bar active state, parent mismatch, and Edit Mode taint
+- fix: stop overwriting point/relative on container position save
 ## v2.46.4 - 2026-03-05
 
 ### Fixed
