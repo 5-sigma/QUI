@@ -567,6 +567,25 @@ local function ShouldShowPowerForUnit(unit)
     return false
 end
 
+local function ResizeHealthForPower(frame, showPowerForUnit)
+    if not frame.healthBar then return end
+    local general = GetGeneralSettings()
+    local borderPx = general and general.borderSize or 1
+    local borderSize = borderPx > 0 and (QUICore.Pixels and QUICore:Pixels(borderPx, frame) or borderPx) or 0
+    local px = QUICore.GetPixelSize and QUICore:GetPixelSize(frame) or 1
+
+    local bottomPad = borderSize
+    if showPowerForUnit then
+        local powerSettings = GetPowerSettings()
+        local powerHeight = QUICore.PixelRound and QUICore:PixelRound(powerSettings.powerBarHeight or 4, frame) or 4
+        bottomPad = borderSize + powerHeight + px
+    end
+
+    frame.healthBar:ClearAllPoints()
+    frame.healthBar:SetPoint("TOPLEFT", frame, "TOPLEFT", borderSize, -borderSize)
+    frame.healthBar:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -borderSize, bottomPad)
+end
+
 local function UpdatePower(frame)
     if not frame or not frame.unit or not frame.powerBar then return end
     local unit = frame.unit
@@ -580,10 +599,14 @@ local function UpdatePower(frame)
     if not ShouldShowPowerForUnit(unit) then
         frame.powerBar:Hide()
         if frame._powerSeparator then frame._powerSeparator:Hide() end
+        if frame._powerBg then frame._powerBg:Hide() end
+        ResizeHealthForPower(frame, false)
         return
     end
     frame.powerBar:Show()
     if frame._powerSeparator then frame._powerSeparator:Show() end
+    if frame._powerBg then frame._powerBg:Show() end
+    ResizeHealthForPower(frame, true)
 
     local power = UnitPower(unit)
     local maxPower = UnitPowerMax(unit)
