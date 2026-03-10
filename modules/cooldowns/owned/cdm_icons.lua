@@ -2096,16 +2096,32 @@ cdEventFrame:RegisterEvent("BAG_UPDATE_COOLDOWN")
 cdEventFrame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 cdEventFrame:RegisterEvent("PLAYER_TARGET_CHANGED")
 
+-- Coalesce rapid cooldown events (SPELL_UPDATE_COOLDOWN, SPELL_UPDATE_CHARGES,
+-- BAG_UPDATE_COOLDOWN) into a single UpdateAllCooldowns call per 50ms window.
+local CD_COALESCE_WINDOW = 0.05
+local cdCoalesceRunning = false
+
+local function FlushCooldownUpdate()
+    cdCoalesceRunning = false
+    CDMIcons:UpdateAllCooldowns()
+end
+
 cdEventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "PLAYER_TARGET_CHANGED" then
         CDMIcons:UpdateAllIconRanges()
-    elseif event == "PLAYER_EQUIPMENT_CHANGED" then
-        -- Trinket slots 13-14: refresh textures and cooldowns
+        return
+    end
+    if event == "PLAYER_EQUIPMENT_CHANGED" then
+        -- Trinket slots 13-14: refresh textures and cooldowns immediately
         if arg1 == 13 or arg1 == 14 then
             CDMIcons:UpdateAllCooldowns()
         end
-    else
-        CDMIcons:UpdateAllCooldowns()
+        return
+    end
+    -- Coalesce cooldown events
+    if not cdCoalesceRunning then
+        cdCoalesceRunning = true
+        C_Timer.After(CD_COALESCE_WINDOW, FlushCooldownUpdate)
     end
 end)
 
