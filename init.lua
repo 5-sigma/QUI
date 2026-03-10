@@ -214,6 +214,16 @@ function QUI:PLAYER_ENTERING_WORLD(_, isInitialLogin, isReloadingUi)
     else
         self:DebugPrint("Debug Mode Enabled")
     end
+
+    -- Eagerly initialize the options panel (hidden) so the pre-builder can
+    -- spread tab construction across frame ticks before the user opens /qui.
+    C_Timer.After(1, function()
+        local GUI = QUI.GUI
+        if GUI and not GUI.MainFrame then
+            GUI:InitializeOptions()
+            GUI.MainFrame:Hide()
+        end
+    end)
 end
 
 function QUI:DebugPrint(...)

@@ -63,6 +63,10 @@ GUI.Colors = {
 
 local C = GUI.Colors
 
+-- _preBuildMode: when true, CreateForm* functions yield after each widget
+-- so PreBuildAllTabs can spread construction across frame ticks.
+GUI._preBuildMode = false
+
 ---------------------------------------------------------------------------
 -- CACHED COLOR COMPONENTS — avoid unpack() in hot-path handlers
 -- Refreshed by GUI:RefreshCachedColors() after accent color changes
@@ -508,54 +512,110 @@ function GUI:RegisterNavigationItem(navType, info)
     table.insert(self.NavigationRegistry, entry)
 end
 
--- Flag to track if search index has been built
-GUI._searchIndexBuilt = false
-
--- Force-load all tabs to populate search registry
-function GUI:ForceLoadAllTabs()
+function GUI:PreBuildAllTabs()
     local frame = self.MainFrame
-    if not frame or not frame.pages then return end
-
-    -- Initialize registry if needed (don't clear - keep registrations from already-visited tabs)
-    if not self.SettingsRegistry then
-        self.SettingsRegistry = {}
-    end
-    if not self.SettingsRegistryKeys then
-        self.SettingsRegistryKeys = {}
+    if not frame or not frame.pages then
+        QUI:DebugPrint("PreBuild aborted — no MainFrame or pages")
+        return
     end
 
-    -- Build each tab that hasn't been built yet
+    -- Build ordered queue of tabs that need pre-building (skip search tab)
+    local queue = {}
     for tabIndex, page in pairs(frame.pages) do
-        if tabIndex ~= self._searchTabIndex then  -- Skip Search tab itself
-            if page and page.createFunc and not page.built then
-                -- Create hidden frame if needed
-                if not page.frame then
-                    page.frame = CreateFrame("Frame", nil, frame.contentArea)
-                    page.frame:SetAllPoints()
-                    page.frame:EnableMouse(false)  -- Container frame - let children handle clicks
-                end
-                page.frame:Hide()  -- Keep hidden during build
-
-                -- Run the builder to register widgets (only once)
-                local loadTab = frame.tabs[tabIndex]
-                if loadTab and loadTab.name then
-                    self:SetSearchContext({
-                        tabIndex = tabIndex,
-                        tabName = loadTab.name,
-                    })
-                end
-                page.createFunc(page.frame)
-                page.built = true  -- Prevent duplicate widget creation
-
-                -- Capture sub-tab group created during page build
-                if GUI._lastSubTabGroup then
-                    page._subTabGroup = GUI._lastSubTabGroup
-                    page._subTabDefs = page._subTabGroup.subTabDefs
-                    GUI._lastSubTabGroup = nil
-                end
-            end
+        if tabIndex ~= self._searchTabIndex and page and page.createFunc and not page.frame then
+            table.insert(queue, tabIndex)
         end
     end
+
+    local qi = 1  -- queue index
+    local buildStart = debugprofilestop()
+
+    -- Stay below perceptible framerate impact while building as fast as possible.
+    local emaFps = nil
+    local function getBatchSize()
+        local raw = GetFramerate()
+        emaFps = emaFps and (0.15 * raw + 0.85 * emaFps) or raw
+        if emaFps >= 50 then return 4
+        elseif emaFps >= 35 then return 2
+        else return 1
+        end
+    end
+
+    local function resumeNext()
+        -- Pause during combat; resume when out
+        if InCombatLockdown() then
+            local tmpFrame = CreateFrame("Frame")
+            tmpFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+            tmpFrame:SetScript("OnEvent", function(self)
+                self:UnregisterAllEvents()
+                self:SetScript("OnEvent", nil)
+                C_Timer.After(0, resumeNext)
+            end)
+            return
+        end
+
+        -- Advance past already-built tabs (user may have clicked them)
+        while qi <= #queue and frame.pages[queue[qi]].built do
+            qi = qi + 1
+        end
+        if qi > #queue then
+            local elapsed = (debugprofilestop() - buildStart) / 1000
+            QUI:DebugPrint(string.format("PreBuild complete in %.1fs", elapsed))
+            return
+        end
+
+        local tabIndex = queue[qi]
+        local page = frame.pages[tabIndex]
+
+        -- First visit to this tab: create frame and coroutine
+        if not page._preBuildCoroutine then
+            page.frame = CreateFrame("Frame", nil, frame.contentArea)
+            page.frame:SetAllPoints()
+            page.frame:EnableMouse(false)
+            page.frame:Hide()
+
+            local tab = frame.tabs[tabIndex]
+            if tab and tab.name then
+                GUI:SetSearchContext({ tabIndex = tabIndex, tabName = tab.name })
+            end
+
+            local createFunc = page.createFunc
+            local tabFrame = page.frame
+            page._preBuildCoroutine = coroutine.create(function()
+                createFunc(tabFrame)
+            end)
+        end
+
+        -- Resume N widgets per tick based on current fps headroom
+        local batchSize = getBatchSize()
+        GUI._preBuildMode = true
+        for _ = 1, batchSize do
+            coroutine.resume(page._preBuildCoroutine)
+            if coroutine.status(page._preBuildCoroutine) == "dead" then break end
+        end
+        GUI._preBuildMode = false
+
+        if coroutine.status(page._preBuildCoroutine) ~= "dead" then
+            -- More widgets remain; schedule next tick
+            C_Timer.After(0, resumeNext)
+        else
+            -- Tab fully built
+            local tabName = (frame.tabs[tabIndex] and frame.tabs[tabIndex].name) or ("tab"..tabIndex)
+            QUI:DebugPrint(string.format("PreBuild [%s] done at %.1fs", tabName, (debugprofilestop() - buildStart) / 1000))
+            if GUI._lastSubTabGroup then
+                page._subTabGroup = GUI._lastSubTabGroup
+                page._subTabDefs = page._subTabGroup.subTabDefs
+                GUI._lastSubTabGroup = nil
+            end
+            page._preBuildCoroutine = nil
+            page.built = true
+            GUI:SetSearchContext({})
+            qi = qi + 1
+            C_Timer.After(0, resumeNext)
+        end
+    end
+
+    C_Timer.After(0, resumeNext)
 end
 
 ---------------------------------------------------------------------------
@@ -2848,6 +2908,35 @@ end
 -- FORM WIDGETS (Label on left, widget on right)
 ---------------------------------------------------------------------------
 
+-- Registers a widget into SettingsRegistry so it appears in search results.
+-- Called at the top of each CreateForm* function so the registry is populated
+-- as a side-effect of real widget construction during PreBuildAllTabs.
+local function RegisterSearchEntry(label, widgetType, registryInfo, builderFn)
+    if not GUI._searchContext.tabIndex or not label or GUI._suppressSearchRegistration then return end
+    local regKey = label .. "_" .. (GUI._searchContext.tabIndex or 0) .. "_" .. (GUI._searchContext.subTabIndex or 0) .. "_" .. (GUI._searchContext.sectionName or "")
+    if GUI.SettingsRegistryKeys[regKey] then return end
+    GUI.SettingsRegistryKeys[regKey] = true
+    local entry = {
+        label = label,
+        lowerLabel = label:lower(),
+        widgetType = widgetType,
+        tabIndex = GUI._searchContext.tabIndex,
+        tabName = GUI._searchContext.tabName,
+        subTabIndex = GUI._searchContext.subTabIndex,
+        subTabName = GUI._searchContext.subTabName,
+        sectionName = GUI._searchContext.sectionName,
+        widgetBuilder = builderFn,
+    }
+    if registryInfo and registryInfo.keywords then
+        entry.keywords = registryInfo.keywords
+        entry.lowerKeywords = {}
+        for i, kw in ipairs(registryInfo.keywords) do
+            entry.lowerKeywords[i] = kw:lower()
+        end
+    end
+    table.insert(GUI.SettingsRegistry, entry)
+end
+
 local FORM_ROW_HEIGHT = 28
 
 ---------------------------------------------------------------------------
@@ -2858,6 +2947,7 @@ local FORM_ROW_HEIGHT = 28
 ---------------------------------------------------------------------------
 function GUI:CreateFormToggle(parent, label, dbKey, dbTable, onChange, registryInfo)
     if parent._hasContent ~= nil then parent._hasContent = true end
+    RegisterSearchEntry(label, "toggle", registryInfo, function(p) return GUI:CreateFormToggle(p, label, dbKey, dbTable, onChange) end)
     local container = CreateFrame("Frame", nil, parent)
     container:SetHeight(FORM_ROW_HEIGHT)
 
@@ -2961,31 +3051,7 @@ function GUI:CreateFormToggle(parent, label, dbKey, dbTable, onChange, registryI
         container:SetAlpha(enabled and 1 or 0.4)
     end
 
-    -- Auto-register for search using current context (if context is set)
-    if GUI._searchContext.tabIndex and label and not GUI._suppressSearchRegistration then
-        local regKey = label .. "_" .. (GUI._searchContext.tabIndex or 0) .. "_" .. (GUI._searchContext.subTabIndex or 0) .. "_" .. (GUI._searchContext.sectionName or "")
-        if not GUI.SettingsRegistryKeys[regKey] then
-            GUI.SettingsRegistryKeys[regKey] = true
-            local entry = {
-                label = label,
-                widgetType = "toggle",
-                tabIndex = GUI._searchContext.tabIndex,
-                tabName = GUI._searchContext.tabName,
-                subTabIndex = GUI._searchContext.subTabIndex,
-                subTabName = GUI._searchContext.subTabName,
-                sectionName = GUI._searchContext.sectionName,
-                widgetBuilder = function(p)
-                    return GUI:CreateFormToggle(p, label, dbKey, dbTable, onChange)
-                end,
-            }
-            -- Add keywords from registryInfo if provided
-            if registryInfo and registryInfo.keywords then
-                entry.keywords = registryInfo.keywords
-            end
-            table.insert(GUI.SettingsRegistry, entry)
-        end
-    end
-
+    if GUI._preBuildMode then coroutine.yield() end
     return container
 end
 
@@ -3097,6 +3163,7 @@ function GUI:CreateFormToggleInverted(parent, label, dbKey, dbTable, onChange)
         container:SetAlpha(enabled and 1 or 0.4)
     end
 
+    if GUI._preBuildMode then coroutine.yield() end
     return container
 end
 
@@ -3192,6 +3259,7 @@ function GUI:CreateFormCheckboxOriginal(parent, label, dbKey, dbTable, onChange)
         end
     end)
 
+    if GUI._preBuildMode then coroutine.yield() end
     return container
 end
 
@@ -3203,6 +3271,7 @@ end
 
 function GUI:CreateFormEditBox(parent, label, dbKey, dbTable, onChange, options, registryInfo)
     if parent._hasContent ~= nil then parent._hasContent = true end
+    RegisterSearchEntry(label, "input", registryInfo, function(p) return GUI:CreateFormEditBox(p, label, dbKey, dbTable, onChange, options) end)
     options = options or {}
     local UIKit = ns.UIKit
 
@@ -3417,34 +3486,12 @@ function GUI:CreateFormEditBox(parent, label, dbKey, dbTable, onChange, options,
     end
     container.isEnabled = true
 
-    if GUI._searchContext.tabIndex and label and not GUI._suppressSearchRegistration then
-        local regKey = label .. "_" .. (GUI._searchContext.tabIndex or 0) .. "_" .. (GUI._searchContext.subTabIndex or 0) .. "_" .. (GUI._searchContext.sectionName or "")
-        if not GUI.SettingsRegistryKeys[regKey] then
-            GUI.SettingsRegistryKeys[regKey] = true
-            local entry = {
-                label = label,
-                widgetType = "editbox",
-                tabIndex = GUI._searchContext.tabIndex,
-                tabName = GUI._searchContext.tabName,
-                subTabIndex = GUI._searchContext.subTabIndex,
-                subTabName = GUI._searchContext.subTabName,
-                sectionName = GUI._searchContext.sectionName,
-                widgetBuilder = function(p)
-                    return GUI:CreateFormEditBox(p, label, dbKey, dbTable, onChange, options)
-                end,
-            }
-            if registryInfo and registryInfo.keywords then
-                entry.keywords = registryInfo.keywords
-            end
-            table.insert(GUI.SettingsRegistry, entry)
-        end
-    end
-
     return container
 end
 
 function GUI:CreateFormSlider(parent, label, min, max, step, dbKey, dbTable, onChange, options, registryInfo)
     if parent._hasContent ~= nil then parent._hasContent = true end
+    RegisterSearchEntry(label, "slider", registryInfo, function(p) return GUI:CreateFormSlider(p, label, min, max, step, dbKey, dbTable, onChange, options) end)
     local container = CreateFrame("Frame", nil, parent)
     container:SetHeight(FORM_ROW_HEIGHT)
     container:EnableMouse(true)  -- Block clicks from passing through to frames behind
@@ -3696,31 +3743,13 @@ function GUI:CreateFormSlider(parent, label, min, max, step, dbKey, dbTable, onC
     -- Initialize enabled state
     container.isEnabled = true
 
-    -- Auto-register for search using current context (if context is set)
-    if GUI._searchContext.tabIndex and label and not GUI._suppressSearchRegistration then
-        local regKey = label .. "_" .. (GUI._searchContext.tabIndex or 0) .. "_" .. (GUI._searchContext.subTabIndex or 0) .. "_" .. (GUI._searchContext.sectionName or "")
-        if not GUI.SettingsRegistryKeys[regKey] then
-            GUI.SettingsRegistryKeys[regKey] = true
-            table.insert(GUI.SettingsRegistry, {
-                label = label,
-                widgetType = "slider",
-                tabIndex = GUI._searchContext.tabIndex,
-                tabName = GUI._searchContext.tabName,
-                subTabIndex = GUI._searchContext.subTabIndex,
-                subTabName = GUI._searchContext.subTabName,
-                sectionName = GUI._searchContext.sectionName,
-                widgetBuilder = function(p)
-                    return GUI:CreateFormSlider(p, label, min, max, step, dbKey, dbTable, onChange, options)
-                end,
-            })
-        end
-    end
-
+    if GUI._preBuildMode then coroutine.yield() end
     return container
 end
 
 function GUI:CreateFormDropdown(parent, label, options, dbKey, dbTable, onChange, registryInfo)
     if parent._hasContent ~= nil then parent._hasContent = true end
+    RegisterSearchEntry(label, "dropdown", registryInfo, function(p) return GUI:CreateFormDropdown(p, label, options, dbKey, dbTable, onChange) end)
     local container = CreateFrame("Frame", nil, parent)
     container:SetHeight(FORM_ROW_HEIGHT)
 
@@ -3986,34 +4015,16 @@ function GUI:CreateFormDropdown(parent, label, options, dbKey, dbTable, onChange
     end
     container.isEnabled = true
 
-    -- Auto-register for search using current context (if context is set)
-    if GUI._searchContext.tabIndex and label and not GUI._suppressSearchRegistration then
-        local regKey = label .. "_" .. (GUI._searchContext.tabIndex or 0) .. "_" .. (GUI._searchContext.subTabIndex or 0) .. "_" .. (GUI._searchContext.sectionName or "")
-        if not GUI.SettingsRegistryKeys[regKey] then
-            GUI.SettingsRegistryKeys[regKey] = true
-            table.insert(GUI.SettingsRegistry, {
-                label = label,
-                widgetType = "dropdown",
-                tabIndex = GUI._searchContext.tabIndex,
-                tabName = GUI._searchContext.tabName,
-                subTabIndex = GUI._searchContext.subTabIndex,
-                subTabName = GUI._searchContext.subTabName,
-                sectionName = GUI._searchContext.sectionName,
-                widgetBuilder = function(p)
-                    return GUI:CreateFormDropdown(p, label, options, dbKey, dbTable, onChange)
-                end,
-            })
-        end
-    end
-
+    if GUI._preBuildMode then coroutine.yield() end
     return container
 end
 
-function GUI:CreateFormColorPicker(parent, label, dbKey, dbTable, onChange, options)
+function GUI:CreateFormColorPicker(parent, label, dbKey, dbTable, onChange, options, registryInfo)
     options = options or {}
     local noAlpha = options.noAlpha or false
 
     if parent._hasContent ~= nil then parent._hasContent = true end
+    RegisterSearchEntry(label, "colorpicker", registryInfo, function(p) return GUI:CreateFormColorPicker(p, label, dbKey, dbTable, onChange, options) end)
     local container = CreateFrame("Frame", nil, parent)
     container:SetHeight(FORM_ROW_HEIGHT)
 
@@ -4087,26 +4098,7 @@ function GUI:CreateFormColorPicker(parent, label, dbKey, dbTable, onChange, opti
         container:SetAlpha(enabled and 1 or 0.4)
     end
 
-    -- Auto-register for search using current context (if context is set)
-    if GUI._searchContext.tabIndex and label and not GUI._suppressSearchRegistration then
-        local regKey = label .. "_" .. (GUI._searchContext.tabIndex or 0) .. "_" .. (GUI._searchContext.subTabIndex or 0) .. "_" .. (GUI._searchContext.sectionName or "")
-        if not GUI.SettingsRegistryKeys[regKey] then
-            GUI.SettingsRegistryKeys[regKey] = true
-            table.insert(GUI.SettingsRegistry, {
-                label = label,
-                widgetType = "colorpicker",
-                tabIndex = GUI._searchContext.tabIndex,
-                tabName = GUI._searchContext.tabName,
-                subTabIndex = GUI._searchContext.subTabIndex,
-                subTabName = GUI._searchContext.subTabName,
-                sectionName = GUI._searchContext.sectionName,
-                widgetBuilder = function(p)
-                    return GUI:CreateFormColorPicker(p, label, dbKey, dbTable, onChange, options)
-                end,
-            })
-        end
-    end
-
+    if GUI._preBuildMode then coroutine.yield() end
     return container
 end
 
@@ -4166,6 +4158,7 @@ function GUI:CreateScrollableTextBox(parent, height, text, options)
 
     container.editBox = editBox
     container.scrollFrame = scrollFrame
+    if GUI._preBuildMode then coroutine.yield() end
     return container
 end
 
@@ -4349,7 +4342,7 @@ function GUI:ExecuteSearch(searchTerm)
         local score = 0
 
         -- Label match (highest priority)
-        local lowerLabel = (entry.label or ""):lower()
+        local lowerLabel = entry.lowerLabel or (entry.label or ""):lower()
         if lowerLabel:find(lowerSearch, 1, true) then
             score = 100
             -- Bonus for starts-with match
@@ -4359,9 +4352,9 @@ function GUI:ExecuteSearch(searchTerm)
         end
 
         -- Keyword match (secondary)
-        if score == 0 and entry.keywords then
-            for _, keyword in ipairs(entry.keywords) do
-                if keyword:lower():find(lowerSearch, 1, true) then
+        if score == 0 and entry.lowerKeywords then
+            for _, lk in ipairs(entry.lowerKeywords) do
+                if lk:find(lowerSearch, 1, true) then
                     score = 50
                     break
                 end
@@ -6039,12 +6032,6 @@ function GUI:SelectTab(frame, index)
         return
     end
 
-    -- Force-load all tabs when Search tab is selected
-    if index == self._searchTabIndex and self._allTabsAdded and not self._searchIndexBuilt then
-        self:ForceLoadAllTabs()
-        self._searchIndexBuilt = true
-    end
-
     -- Auto-focus search input when navigating to Search tab
     if index == self._searchTabIndex then
         C_Timer.After(0, function()
@@ -6104,6 +6091,23 @@ function GUI:SelectTab(frame, index)
                 page.createFunc(page.frame)
                 page.built = true
             end
+        end
+
+        -- If background pre-build is in progress, drain it synchronously now
+        if page._preBuildCoroutine and coroutine.status(page._preBuildCoroutine) == "suspended" then
+            GUI._preBuildMode = true
+            while coroutine.status(page._preBuildCoroutine) == "suspended" do
+                coroutine.resume(page._preBuildCoroutine)
+            end
+            GUI._preBuildMode = false
+            if GUI._lastSubTabGroup then
+                page._subTabGroup = GUI._lastSubTabGroup
+                page._subTabDefs = page._subTabGroup.subTabDefs
+                GUI._lastSubTabGroup = nil
+            end
+            page._preBuildCoroutine = nil
+            page.built = true
+            GUI:SetSearchContext({})
         end
 
         -- Capture sub-tab group created during page build
@@ -6213,8 +6217,7 @@ function GUI:RefreshAccentColor()
     self.MainFrame:SetParent(nil)
     self.MainFrame = nil
 
-    -- Reset search index state (will be rebuilt from dedup keys)
-    self._searchIndexBuilt = false
+    -- Reset search registry (will be repopulated by PreBuildAllTabs)
     self._allTabsAdded = false
     self.SettingsRegistry = {}
     self.SettingsRegistryKeys = {}
